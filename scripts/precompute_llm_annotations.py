@@ -35,6 +35,7 @@ Usage:
 """
 
 import argparse
+import random
 import time
 from pathlib import Path
 
@@ -47,6 +48,14 @@ from src.features.llm_backend import (
     load_vllm_model,
     make_hf_batch_generate_fn,
     make_vllm_batch_generate_fn,
+)
+from src.features.llm_config import (
+    ENABLE_THINKING,
+    PRESENCE_PENALTY,
+    REPETITION_PENALTY,
+    TEMPERATURE,
+    TOP_K,
+    TOP_P,
 )
 from src.features.llm_mastery_check import CACHE_PATH as MASTERY_CACHE_PATH
 from src.features.llm_mastery_check import PROMPT_VERSION as MASTERY_PROMPT_VERSION
@@ -72,14 +81,40 @@ def _save_cache(cache: dict, path: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("model_path", help="local directory of the production model, or an HF hub id when --backend hf")
-    parser.add_argument("--model-id", required=True, help="filesystem-safe label, baked into both cache filenames")
+    parser.add_argument(
+        "--model-id",
+        required=True,
+        help=(
+            "filesystem-safe label, baked into both cache filenames. Use a one-off label "
+            "(e.g. qwen3-8b-awq__ab-b) for ANY non-final-config trial run (sampling A/B, "
+            "checkpoint comparison, etc.) -- sampling config is NOT part of the cache "
+            "filename, so a trial run under the real model-id silently mixes its results "
+            "into the production cache with no way to tell them apart afterwards. Only run "
+            "under the real model-id once config is frozen; that run's --limit smoke output "
+            "counts toward the full run (session-atomic resume, see module docstring)."
+        ),
+    )
     parser.add_argument("--strategy-prompt-version", default=STRATEGY_PROMPT_VERSION)
     parser.add_argument("--mastery-prompt-version", default=MASTERY_PROMPT_VERSION)
     parser.add_argument("--tasks", default="strategy,mastery", help="comma-separated subset of {strategy,mastery}")
     parser.add_argument("--backend", choices=["vllm", "hf"], default="vllm", help="'hf' is a local-smoke-test-only path")
-    parser.add_argument("--limit", type=int, default=None, help="only process the first N not-yet-done sessions -- for smoke tests")
-    parser.add_argument("--no-thinking", action="store_true")
-    parser.add_argument("--repetition-penalty", type=float, default=1.3)
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help=(
+            "only process the first N not-yet-done sessions -- for smoke tests. Session "
+            "order is a fixed-seed shuffle of the training corpus (see session_ids below), "
+            "not raw file order -- raw order is biased (sessions with more responses cluster "
+            "earlier), so a --limit subset needs the shuffle to be representative."
+        ),
+    )
+    parser.add_argument("--no-thinking", action="store_true", help=f"default follows llm_config.ENABLE_THINKING={ENABLE_THINKING}")
+    parser.add_argument("--repetition-penalty", type=float, default=REPETITION_PENALTY)
+    parser.add_argument("--temperature", type=float, default=TEMPERATURE, help="0 = greedy (vLLM convention)")
+    parser.add_argument("--top-p", type=float, default=TOP_P)
+    parser.add_argument("--top-k", type=int, default=TOP_K)
+    parser.add_argument("--presence-penalty", type=float, default=PRESENCE_PENALTY, help="vllm backend only")
     parser.add_argument("--max-new-tokens", type=int, default=COMBINED_MAX_NEW_TOKENS)
     parser.add_argument("--retry-max-new-tokens", type=int, default=COMBINED_RETRY_MAX_NEW_TOKENS)
     parser.add_argument("--chunk-size", type=int, default=300, help="sessions per batch call, cache checkpointed after each")
@@ -101,6 +136,20 @@ def main() -> None:
     for row in df.itertuples(index=False):
         responses_by_session.setdefault(row.session_id, []).append((row.response_id, row.learning_objective))
     session_ids = list(responses_by_session.keys())
+    # Fixed-seed shuffle -- train_features is sorted by response_id (hash
+    # order), which looks random but ISN'T for session-level first-appearance
+    # order: a session's chance of contributing the lexicographically-smallest
+    # response_id in the file rises with how many responses it has, so
+    # multi-response sessions systematically cluster earlier. Measured
+    # 2026-07-25: first 5,000 sessions in raw order average 1.93
+    # responses/session and 68.7% is_correct vs 1.43/66.6% for the remaining
+    # 17,821 -- a real bias, not a theoretical one. Matters because --limit
+    # takes "first N remaining", used both for smoke tests and for the
+    # 30B-A3B subset run that a real go/no-go CV comparison depends on.
+    # Fixed seed (not re-randomized per run): keeps "first N remaining"
+    # stable across resumed runs, same determinism the session-atomic
+    # checkpointing above already relies on.
+    random.Random(42).shuffle(session_ids)
 
     def session_done(sid: str) -> bool:
         if do_strategy and sid not in strategy_cache:
@@ -123,13 +172,25 @@ def main() -> None:
     if args.backend == "vllm":
         llm = load_vllm_model(args.model_path)
         generate_batch_fn = make_vllm_batch_generate_fn(
-            llm, enable_thinking=not args.no_thinking, repetition_penalty=args.repetition_penalty
+            llm,
+            enable_thinking=not args.no_thinking,
+            repetition_penalty=args.repetition_penalty,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            presence_penalty=args.presence_penalty,
         )
         count_tokens = llm.get_tokenizer().encode
     else:
         tokenizer, model = load_hf_model(args.model_path, load_in_4bit=True)
         generate_batch_fn = make_hf_batch_generate_fn(
-            tokenizer, model, enable_thinking=not args.no_thinking, repetition_penalty=args.repetition_penalty
+            tokenizer,
+            model,
+            enable_thinking=not args.no_thinking,
+            repetition_penalty=args.repetition_penalty,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
         )
         count_tokens = tokenizer.encode
     print(f"model loaded in {time.time() - load_start:.1f}s")

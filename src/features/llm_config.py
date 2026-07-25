@@ -24,6 +24,29 @@ feature-specific.
 ENABLE_THINKING = True
 REPETITION_PENALTY = 1.3
 
+# Sampling config -- PRE-A/B-DECISION as of 2026-07-25, see
+# gpu_rental/RUNBOOK.md's mandatory sampling-config A/B smoke step. Qwen3's
+# own model card explicitly recommends AGAINST greedy decoding for thinking
+# mode (temperature=0.6/top_p=0.95/top_k=20/min_p=0, presence_penalty 0-2
+# for repetition control instead), warning that greedy causes endless
+# repetition and degraded output -- exactly the failure mode
+# REPETITION_PENALTY=1.3 above was introduced to patch (see this module's
+# docstring). That patch may have been treating a symptom of using greedy
+# in the first place, not the root cause. TEMPERATURE=0 below means
+# "greedy" (make_vllm_batch_generate_fn's temperature=0-triggers-greedy
+# convention) -- these four values are what the RUNBOOK's A/B smoke test
+# (group A = these defaults, group B = Qwen3's own recommendation) decides
+# between BEFORE any full-corpus run starts. Do not hand-edit these without
+# running that A/B first, and do not start a real (non-throwaway
+# --model-id) full run until this block reflects the winner -- both
+# submission_src/main.py and scripts/precompute_llm_annotations.py read
+# these directly rather than hardcoding their own copies, same
+# single-source-of-truth discipline as ENABLE_THINKING/REPETITION_PENALTY.
+TEMPERATURE = 0.0
+TOP_P = 1.0
+TOP_K = -1
+PRESENCE_PENALTY = 0.0
+
 # Wall-clock safety net for submission_src/main.py's production LLM-scoring
 # step ONLY -- see src.features.llm_annotate.score_combined_chunked, which
 # is what actually uses this. NEVER applied to

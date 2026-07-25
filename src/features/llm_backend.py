@@ -85,7 +85,15 @@ def load_hf_model(model_name: str, load_in_4bit: bool = False):
 
 
 def _generate_hf(
-    tokenizer, model, prompt: str, max_new_tokens: int, enable_thinking: bool = True, repetition_penalty: float = 1.0
+    tokenizer,
+    model,
+    prompt: str,
+    max_new_tokens: int,
+    enable_thinking: bool = True,
+    repetition_penalty: float = 1.0,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    top_k: int = 0,
 ) -> str:
     """transformers backend: one chat-templated forward+decode pass, greedy
     (do_sample=False -- deterministic given frozen weights). Returns only
@@ -111,7 +119,16 @@ def _generate_hf(
     volume...") five times running out the token budget with no JSON ever
     produced -- a classic greedy-decoding repetition trap, distinct from the
     thinking-mode length problem above. Not yet validated as an actual fix,
-    just wired through so it can be tested rather than hand-waved."""
+    just wired through so it can be tested rather than hand-waved.
+
+    temperature/top_p/top_k: default 0/1.0/0 reproduces this function's
+    prior hardcoded do_sample=False (always greedy) -- sampling only turns
+    on if temperature > 0, mirroring make_vllm_batch_generate_fn's
+    temperature=0-triggers-greedy convention so a caller's CLI flags mean
+    the same thing on both backends. Needed to actually exercise Qwen3's own
+    documented thinking-mode recommendation (temperature=0.6/top_p=0.95/
+    top_k=20 -- explicitly NOT greedy, see gpu_rental/RUNBOOK.md's sampling
+    A/B) locally too, not just on the rented box."""
     messages = [{"role": "user", "content": prompt}]
     inputs = tokenizer.apply_chat_template(
         messages,
@@ -124,18 +141,29 @@ def _generate_hf(
         # always pass rather than special-case Qwen3's template specifically.
         enable_thinking=enable_thinking,
     ).to(model.device)
+    do_sample = temperature > 0
+    generate_kwargs = dict(
+        max_new_tokens=max_new_tokens,
+        do_sample=do_sample,
+        pad_token_id=tokenizer.eos_token_id,
+        repetition_penalty=repetition_penalty,
+    )
+    if do_sample:
+        generate_kwargs.update(temperature=temperature, top_p=top_p, top_k=top_k)
     with torch.no_grad():
-        out = model.generate(
-            inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id,
-            repetition_penalty=repetition_penalty,
-        )
+        out = model.generate(inputs, **generate_kwargs)
     return tokenizer.decode(out[0, inputs.shape[1] :], skip_special_tokens=True)
 
 
-def make_hf_generate_fn(tokenizer, model, enable_thinking: bool = True, repetition_penalty: float = 1.0):
+def make_hf_generate_fn(
+    tokenizer,
+    model,
+    enable_thinking: bool = True,
+    repetition_penalty: float = 1.0,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    top_k: int = 0,
+):
     """Binds a loaded transformers tokenizer/model into the backend-agnostic
     `generate_fn(prompt, max_new_tokens) -> str` shape every LLM feature
     module expects -- the swap point for a future vLLM equivalent (see
@@ -143,13 +171,29 @@ def make_hf_generate_fn(tokenizer, model, enable_thinking: bool = True, repetiti
 
     def generate_fn(prompt: str, max_new_tokens: int) -> str:
         return _generate_hf(
-            tokenizer, model, prompt, max_new_tokens, enable_thinking=enable_thinking, repetition_penalty=repetition_penalty
+            tokenizer,
+            model,
+            prompt,
+            max_new_tokens,
+            enable_thinking=enable_thinking,
+            repetition_penalty=repetition_penalty,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
         )
 
     return generate_fn
 
 
-def make_hf_batch_generate_fn(tokenizer, model, enable_thinking: bool = True, repetition_penalty: float = 1.0):
+def make_hf_batch_generate_fn(
+    tokenizer,
+    model,
+    enable_thinking: bool = True,
+    repetition_penalty: float = 1.0,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    top_k: int = 0,
+):
     """Adapts make_hf_generate_fn's one-at-a-time contract into the batch
     shape (`generate_batch_fn(prompts, max_new_tokens) -> list[str]`) that
     scripts/precompute_llm_*.py and score_sessions_batch/score_responses_batch
@@ -163,7 +207,13 @@ def make_hf_batch_generate_fn(tokenizer, model, enable_thinking: bool = True, re
     local HF backend has always taken (see experiments.md), just called
     in a loop instead of one at a time by the caller."""
     generate_fn = make_hf_generate_fn(
-        tokenizer, model, enable_thinking=enable_thinking, repetition_penalty=repetition_penalty
+        tokenizer,
+        model,
+        enable_thinking=enable_thinking,
+        repetition_penalty=repetition_penalty,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
     )
 
     def generate_batch_fn(prompts: list[str], max_new_tokens: int) -> list[str]:
@@ -204,7 +254,15 @@ def load_vllm_model(model_path: str, **llm_kwargs):
     return LLM(model=model_path, quantization="awq", dtype="float16", **llm_kwargs)
 
 
-def make_vllm_batch_generate_fn(llm, enable_thinking: bool = True, repetition_penalty: float = 1.0):
+def make_vllm_batch_generate_fn(
+    llm,
+    enable_thinking: bool = True,
+    repetition_penalty: float = 1.0,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    top_k: int = -1,
+    presence_penalty: float = 0.0,
+):
     """Batched production backend -- see module docstring for why this is
     a `(prompts: list[str], max_new_tokens: int) -> list[str]` shape rather
     than `make_hf_generate_fn`'s one-at-a-time contract, and why batching
@@ -212,8 +270,20 @@ def make_vllm_batch_generate_fn(llm, enable_thinking: bool = True, repetition_pe
 
     temperature=0 (not do_sample=False -- vLLM's SamplingParams uses a
     temperature knob, and temperature=0 triggers vLLM's own greedy-decoding
-    path internally) for the same determinism rationale as the HF backend:
-    frozen weights, no reason to introduce sampling variance.
+    path internally): this default reflects this project's
+    PRE-A/B-decision configuration (src.features.llm_config.TEMPERATURE),
+    NOT an endorsement -- Qwen3's own model card explicitly recommends
+    AGAINST greedy for thinking mode (temperature=0.6/top_p=0.95/top_k=20,
+    presence_penalty for repetition control instead), warning that greedy
+    causes endless repetition and degraded output. top_p/top_k are no-ops
+    while temperature=0 (vLLM's greedy path ignores them); they matter once
+    a caller passes the non-greedy config. See gpu_rental/RUNBOOK.md's
+    sampling A/B smoke step, which decides between the two configs BEFORE
+    any full-corpus run -- callers should pass these four straight through
+    from llm_config rather than hardcoding their own values, so the
+    offline-labeling run and submission_src/main.py's production run can
+    never silently diverge on sampling behavior (same rationale as
+    ENABLE_THINKING/REPETITION_PENALTY already living in llm_config).
     """
     from vllm import SamplingParams
 
@@ -251,7 +321,12 @@ def make_vllm_batch_generate_fn(llm, enable_thinking: bool = True, repetition_pe
         ]
         if max_new_tokens not in sampling_params_cache:
             sampling_params_cache[max_new_tokens] = SamplingParams(
-                max_tokens=max_new_tokens, temperature=0, repetition_penalty=repetition_penalty
+                max_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                presence_penalty=presence_penalty,
+                repetition_penalty=repetition_penalty,
             )
         outputs = llm.generate(formatted, sampling_params_cache[max_new_tokens])
         return [o.outputs[0].text for o in outputs]

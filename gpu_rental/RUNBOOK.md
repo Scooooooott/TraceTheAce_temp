@@ -116,36 +116,71 @@ HF_HUB_ENABLE_HF_TRANSFER=1 uv run huggingface-cli download QuixiAI/Qwen3-30B-A3
 bash gpu_rental/sync_caches.sh <instance> ~/trace-the-ace 600
 ```
 
-## 阶段 2 — 冒烟(~40-60 分钟,比之前多一项)
+## 阶段 2a — 采样配置 A/B(必测项,~20-30 分钟,8B 上跑,在阶段2主冒烟之前)
+
+**背景(2026-07-25 定案)**:现在 `llm_config.py` 冻结的是 `temperature=0(greedy)+repetition_penalty=1.3`——1.3 是当时为了压住一次真实撞见的贪心解码重复陷阱(见 experiments.md 2026-07-24)硬加的。但 Qwen3 官方 model card 明确**不建议**thinking 模式用贪心解码,推荐 `temperature=0.6, top_p=0.95, top_k=20, min_p=0`,重复控制用 `presence_penalty`(0-2 区间),并直接警告贪心会导致无尽重复和性能退化——也就是说 1.3+greedy 很可能是给一个反模式打的补丁,而不是修复了根因。1.3 本身也偏高(常规区间 1.05-1.15),对 thinking 质量和 JSON 里合法的重复 token(键名、重复数字)有潜在隐性损伤,本地小样本验证看不出来。
+
+**这条不能跳过,也不能现在盲改**——1.3+greedy 是目前唯一有本地验证背书的配置,deploy 前必须用真实模型对比一次,不能凭 model card 的通用建议直接切换。
+
+**关键:A/B 两组都必须用一次性 `--model-id`,不能用正式的 `qwen3-8b-awq`**——缓存文件名只烤了 `model_id + prompt_version`,不含采样参数,用正式 model-id 跑 A/B 会把不同采样配置的结果混进同一份正式缓存,写完就再也分不清哪 30 条是哪组配置产出的。
 
 ```bash
-uv run python -m scripts.precompute_llm_annotations ./models/Qwen3-8B-AWQ --model-id qwen3-8b-awq --backend vllm --limit 30
-uv run python -m scripts.precompute_llm_annotations ./models/Qwen3-30B-A3B-AWQ --model-id qwen3-30b-a3b-awq --backend vllm --limit 30
+# A 组(现配置,基线)
+uv run python -m scripts.precompute_llm_annotations ./models/Qwen3-8B-AWQ \
+  --model-id qwen3-8b-awq__ab-a --backend vllm --limit 30 2>&1 | tee logs/ab_a.log
+
+# B 组(Qwen3 官方推荐,rep_penalty 归 1.0 只用 presence_penalty,二选一别叠加)
+uv run python -m scripts.precompute_llm_annotations ./models/Qwen3-8B-AWQ \
+  --model-id qwen3-8b-awq__ab-b --backend vllm --limit 30 \
+  --temperature 0.6 --top-p 0.95 --top-k 20 --repetition-penalty 1.0 --presence-penalty 1.5 \
+  2>&1 | tee logs/ab_b.log
+```
+
+对比四项 + 肉眼抽查:首轮解析失败率、撞 cap 率(退化)、两任务 thinking 长度分布(`_summarize_lengths` 那行)、标签分布是否有区分度(不是全坍缩成同一个值)。
+
+判定:B 组解析率不差且退化消失 → **切 B**,把 `src/features/llm_config.py` 的 `TEMPERATURE/TOP_P/TOP_K/PRESENCE_PENALTY/REPETITION_PENALTY` 改成 B 组的值(`main.py` 和 precompute 脚本都从这里读,改一处两边同步冻结)。B 组反而不稳/未见改善 → 留 1.3+greedy,至少是被数据背书过的选择,`llm_config.py` 不用动。
+
+**决定之后**,用正式 `--model-id qwen3-8b-awq` 再跑一次 `--limit 30` 冒烟(不带任何 A/B 覆盖参数,让它读 `llm_config.py` 刚冻结的值)——这次才是计入全量、真正验收的冒烟(阶段2的第一条命令就是它),A/B 那两个一次性缓存文件事后直接删掉。
+
+## 阶段 2 — 冒烟(~40-60 分钟)
+
+```bash
+uv run python -m scripts.precompute_llm_annotations ./models/Qwen3-8B-AWQ --model-id qwen3-8b-awq --backend vllm --limit 30 2>&1 | tee logs/smoke_8b.log
+uv run python -m scripts.precompute_llm_annotations ./models/Qwen3-30B-A3B-AWQ --model-id qwen3-30b-a3b-awq --backend vllm --limit 30 2>&1 | tee logs/smoke_30b.log
 ```
 
 检查清单:
 - [ ] 两个模型都能加载,无版本/内核报错(**8B 先跑,已知能跑,用它排查环境问题最快**)
-- [ ] 显存峰值(`watch nvidia-smi`)
+- [ ] 显存峰值(`watch -n 2 nvidia-smi`,另开一个 tmux 窗口)
 - [ ] `chunk` 打印的耗时/ETA——记录 cold prefill+decode 吞吐,替换预算表里的假设区间
 - [ ] **`score_combined` 打印的重试统计**(`N/total needed retry, M/N still failed`)——首轮失败率 > 3-5% 就先回去改 prompt 措辞(退化对指令措辞敏感),不要指望重试硬扛
-- [ ] **vLLM 的 prefix cache 命中率**(日志 `gpu_prefix_cache_hit_rate`,或用实测吞吐反推)——理论上界约 `前缀占比×(session内平均请求数-1)/该请求数`;如果显著低于这个数,两个旋钮按序试:调小 `--chunk-size`(默认300,先试100)、把每个 session 的 strategy 请求提前一个 chunk
+- [ ] **vLLM 的 prefix cache 命中率**(日志里 vLLM 自己周期性打印的吞吐/命中率行,不是我们代码打的,格式以实际跑出来的为准)——理论上界约 `前缀占比×(session内平均请求数-1)/该请求数`;如果显著低于这个数,两个旋钮按序试:调小 `--chunk-size`(默认300,先试100)、把每个 session 的 strategy 请求提前一个 chunk
 - [ ] 抽查缓存内容,标签有真实差异,不是全部退化成同一个值
-- [ ] (可选,冒烟顺手做)`repetition_penalty` 从 1.3 试到 1.05 一次,看对退化尾部和 JSON 合法重复键名的影响,不要盲改 `llm_config.py` 里的默认值
+- [ ] 两任务输出 token 长度分布(脚本每个 chunk 后自动打印 `output tokens (cumulative): ...`,按 strategy/mastery 分开)
 - [ ] 用实测吞吐重算一遍训练侧(全量)和容器侧(测试集)总耗时
 - [ ] **决策点**:30B-A3B 若容器侧估时 > 4.5h,出局,本次只跑 8B 全量
 
-## 阶段 3 — 8B 全量(+ 30B-A3B 若通过决策点)
+## 阶段 3 — 8B 全量过夜(7-12h,保底落袋)
+
+启动前过一遍:阶段2a 的 A/B 结论已经写进 `llm_config.py`(或者确认维持 1.3+greedy)、A/B 那两个一次性缓存文件已经删掉、确认正式 `--model-id qwen3-8b-awq` 冒烟是用冻结后的配置跑的。三件事按顺序过完再回车。tmux 里 `nohup` 是冗余的(tmux 本身就防挂断)但无害,保留:
 
 ```bash
 nohup uv run python -m scripts.precompute_llm_annotations ./models/Qwen3-8B-AWQ --model-id qwen3-8b-awq --backend vllm > annotations_8b.log 2>&1 &
 wait
+```
 
-# 仅当阶段2决策点通过:
-nohup uv run python -m scripts.precompute_llm_annotations ./models/Qwen3-30B-A3B-AWQ --model-id qwen3-30b-a3b-awq --backend vllm > annotations_30b.log 2>&1 &
+`sync_caches.sh` 本地持续跑着,每 10 分钟自动回传。盯前 20 分钟确认吞吐、checkpoint 落盘、显存稳定,然后可以离开去睡。每半小时(醒着的话)`tail -f *.log` 瞄一眼 ETA。
+
+## 次日 — 30B-A3B 视判定跑子集
+
+阶段2决策点 GO 或边缘区才跑,否则整个跳过,只有 8B 落袋:
+
+```bash
+nohup uv run python -m scripts.precompute_llm_annotations ./models/Qwen3-30B-A3B-AWQ --model-id qwen3-30b-a3b-awq --backend vllm --limit 5000 > annotations_30b.log 2>&1 &
 wait
 ```
 
-`sync_caches.sh` 本地持续跑着,每 10 分钟自动回传。期间每半小时 `tail -f *.log` 瞄一眼 ETA。
+只跑 5k 子集(2-4h),不跑全量——8B 已经是全量,配对比较不需要 30B 也全量。`--limit` 现在是固定种子(42)shuffle 过的 session 顺序取前 N(2026-07-25 修复,见 precompute 脚本内注释),不是原始文件序——原始文件按 response_id 排序,response 数越多的 session 系统性排得越靠前(实测:原始序前5000个 session 平均每 session 多 35% response、正确率高2个百分点),shuffle 前直接用 `--limit 5000` 会给 CV 判定带来有偏子集。这个修复已经在推到临时仓库的代码里,`git clone` 下来就是修好的版本。
 
 ## 阶段 4 — 收尾(~15 分钟)
 
@@ -156,10 +191,15 @@ for f in ['llm_strategy_tags_cache__qwen3-8b-awq__prompt-v2',
           'llm_mastery_check_cache__qwen3-8b-awq__prompt-v2']:
     d = pd.read_pickle(f'gpu_rental/backup/{f}.pkl')
     print(f, len(d))
+# 仅当 30B-A3B 跑了 5k 子集:
+for f in ['llm_strategy_tags_cache__qwen3-30b-a3b-awq__prompt-v2',
+          'llm_mastery_check_cache__qwen3-30b-a3b-awq__prompt-v2']:
+    d = pd.read_pickle(f'gpu_rental/backup/{f}.pkl')
+    print(f, len(d))
 "
 ```
 
-应分别等于 22,821 / 35,072。核对无误后再关实例,本地单独下载一份选定模型权重:
+8B 应分别等于 22,821 / 35,072(全量)。30B-A3B(若跑了子集)strategy 应为 5,000,mastery 约 7,000-8,000(取决于这 5000 个 session 各自的 response 数,不是固定值)。核对无误后再关实例,本地单独下载一份选定模型权重:
 
 ```bash
 uv run huggingface-cli download Qwen/Qwen3-8B-AWQ --local-dir ./models/Qwen3-8B-AWQ
