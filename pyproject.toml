@@ -1,0 +1,40 @@
+[project]
+name = "trace-the-ace"
+version = "0.0.0"
+description = "DrivenData Trace the Ace: Tutoring Outcomes Prediction Challenge"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "pandas",
+    "numpy",
+    "scikit-learn==1.8.0",  # pinned to match the competition runtime container exactly -- sklearn doesn't guarantee cross-version pickle compatibility
+    "lightgbm",
+    "tiktoken",
+    "torch",
+    # sentence-transformers/transformers pinned to match the competition
+    # runtime container exactly (checked via `docker run ... pip show`),
+    # same rationale as the scikit-learn pin above.
+    "sentence-transformers==5.5.0",
+    "transformers==4.57.6",
+    "accelerate>=1.14.0",
+]
+
+[dependency-groups]
+dev = [
+    "jupyter",
+    "matplotlib",
+]
+# Local-dev-only 4-bit quantization for src/features/llm_strategy_tags.py's
+# load_hf_model(load_in_4bit=True) path -- lets a bigger candidate model fit
+# in this machine's 8GB VRAM for the small-scale validation script. Never
+# needed in the competition runtime: the production path serves an
+# AWQ-quantized checkpoint through vLLM's own kernels, which don't import
+# bitsandbytes at all (confirmed absent from tutoring-outcomes-runtime's
+# resolved uv.lock). Kept as its own group, not `dev`, so a plain `uv sync`
+# for the classical-ML pipeline never pulls in an unused GPU quantization
+# library.
+llm-dev = [
+    "bitsandbytes",
+]
+
+[tool.uv]
+environments = ["sys_platform == 'linux'"]
