@@ -73,18 +73,25 @@ tmux new -s gpu_run
 
 ## 阶段 1 — 上传数据 + 装环境(并行,~20-40 分钟)
 
-本地:
+代码走 git(2026-07-25 定案,不再用 rsync 传代码 -- 已把 precompute 脚本真正 import 到的最小依赖闭包推到
+https://github.com/Scooooooott/TraceTheAce_temp.git:src/data.py、src/features/session_stats.py、
+llm_config/llm_strategy_tags/llm_mastery_check/llm_backend/llm_annotate.py、
+scripts/precompute_llm_annotations.py、gpu_rental/、pyproject.toml、uv.lock。不含 data/raw -- 比赛数据不进
+第三方托管的 git 仓库,数据仍走下面的 tar 包)。
+
+本地(只需传数据):
 ```bash
 cd /home/scott/workspace/trace-the-ace
-tar -czf /tmp/trace-the-ace-raw.tar.gz -C data raw
-rsync -avz --exclude .venv --exclude data/processed ./ <instance>:~/trace-the-ace/
-rsync -avz /tmp/trace-the-ace-raw.tar.gz <instance>:~/trace-the-ace/
+tar --exclude=raw/train_transcripts.zip -czf /tmp/trace-the-ace-raw.tar.gz -C data raw
+rsync -avz /tmp/trace-the-ace-raw.tar.gz <instance>:~/trace-the-ace-raw.tar.gz
 ```
 
 远程(tmux 里):
 ```bash
+git clone https://github.com/Scooooooott/TraceTheAce_temp.git ~/trace-the-ace
 cd ~/trace-the-ace
-tar -xzf trace-the-ace-raw.tar.gz -C data
+mkdir -p data
+tar -xzf ~/trace-the-ace-raw.tar.gz -C data
 bash gpu_rental/setup_instance.sh
 ```
 
@@ -92,8 +99,16 @@ bash gpu_rental/setup_instance.sh
 
 ```bash
 HF_HUB_ENABLE_HF_TRANSFER=1 uv run huggingface-cli download Qwen/Qwen3-8B-AWQ --local-dir ./models/Qwen3-8B-AWQ
-# 30B-A3B 候选(社区 AWQ checkpoint,注意挑口碑好的来源,如 QuixiAI/ELVISIO):
-HF_HUB_ENABLE_HF_TRANSFER=1 uv run huggingface-cli download <30B-A3B-AWQ repo> --local-dir ./models/Qwen3-30B-A3B-AWQ
+# 30B-A3B 主选(2026-07-25 定死,不要当天现挑):QuixiAI/Qwen3-30B-A3B-AWQ
+# 月下载量 50k、明确写 vllm>=0.8.5、基于原始 hybrid-thinking 的 Qwen/Qwen3-30B-A3B
+# 量化(不是后来拆分成 Instruct-2507/Thinking-2507 那批 -- 那些不支持
+# make_vllm_batch_generate_fn 依赖的 enable_thinking 切换,选错等于重演
+# enable_thinking=False 那次内容坍缩故障)。
+HF_HUB_ENABLE_HF_TRANSFER=1 uv run huggingface-cli download QuixiAI/Qwen3-30B-A3B-AWQ --local-dir ./models/Qwen3-30B-A3B-AWQ
+# 备胎(主选加载失败/输出异常时换这个,只试一次,不行就 30B-A3B 出局):
+# ELVISIO/Qwen3-30B-A3B-AWQ -- 月下载量 12k,同样基于原始 hybrid-thinking 基座,
+# model card 明确示例代码带 enable_thinking=True。
+# HF_HUB_ENABLE_HF_TRANSFER=1 uv run huggingface-cli download ELVISIO/Qwen3-30B-A3B-AWQ --local-dir ./models/Qwen3-30B-A3B-AWQ-backup
 ```
 
 本地(另开终端):

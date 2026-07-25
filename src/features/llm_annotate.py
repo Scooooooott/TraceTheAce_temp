@@ -54,6 +54,7 @@ def score_combined(
     mastery_session_of: dict[str, str],
     max_new_tokens: int = COMBINED_MAX_NEW_TOKENS,
     retry_max_new_tokens: int | None = COMBINED_RETRY_MAX_NEW_TOKENS,
+    on_generated=None,
 ) -> tuple[dict[str, dict], dict[str, dict]]:
     """strategy_prompts: session_id -> prompt, for every session that needs
     an llm_strategy_tags result this call.
@@ -62,6 +63,13 @@ def score_combined(
     mastery_session_of: response_id -> session_id, used only to group
     mastery_prompts by session for interleaved submission order -- every
     key in mastery_prompts must have an entry here.
+    on_generated: optional (kind, generated_text) -> None callback, invoked
+    once per PRIMARY-pass (not retry-pass) generated text, in the same
+    "strategy"/"mastery" kind vocabulary as the results dicts. Purely an
+    observability hook (e.g. scripts/precompute_llm_annotations.py uses it
+    to track output-token-length distribution per task) -- has no effect on
+    scoring/caching behavior, and defaults to None (no-op) so existing
+    callers (submission_src/main.py) are unaffected.
 
     Returns (strategy_results, mastery_results), each a dict from the
     original id to its coerced tags dict (FALLBACK_TAGS for anything that
@@ -110,6 +118,9 @@ def score_combined(
         return strategy_results, mastery_results
 
     generated_texts = generate_batch_fn(prompts, max_new_tokens)
+    if on_generated is not None:
+        for (kind, _id), text in zip(requests, generated_texts):
+            on_generated(kind, text)
     failed_indices = []
     for i, ((kind, id_), generated) in enumerate(zip(requests, generated_texts)):
         obj = _extract(kind, generated)
@@ -150,6 +161,7 @@ def score_combined_chunked(
     time_budget_seconds: float | None = None,
     max_new_tokens: int = COMBINED_MAX_NEW_TOKENS,
     retry_max_new_tokens: int | None = COMBINED_RETRY_MAX_NEW_TOKENS,
+    on_generated=None,
 ) -> tuple[dict[str, dict], dict[str, dict]]:
     """Chunked wrapper around score_combined, with an optional wall-clock
     time-budget circuit breaker -- used by submission_src/main.py, NOT by
@@ -218,6 +230,7 @@ def score_combined_chunked(
             chunk_mastery_session_of,
             max_new_tokens=max_new_tokens,
             retry_max_new_tokens=retry_max_new_tokens,
+            on_generated=on_generated,
         )
         strategy_results.update(chunk_strategy_results)
         mastery_results.update(chunk_mastery_results)

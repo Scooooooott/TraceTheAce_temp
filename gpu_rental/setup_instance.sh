@@ -39,5 +39,5 @@ uv pip install hf_transfer huggingface_hub
 echo ""
 echo "Setup done. Next: download the candidate model(s), e.g.:"
 echo '  HF_HUB_ENABLE_HF_TRANSFER=1 uv run huggingface-cli download Qwen/Qwen3-8B-AWQ --local-dir ./models/Qwen3-8B-AWQ'
-echo '  HF_HUB_ENABLE_HF_TRANSFER=1 uv run huggingface-cli download <32B-AWQ-repo> --local-dir ./models/Qwen3-32B-AWQ'
-echo "See RUNBOOK.md for the rest of the day's sequence."
+echo '  HF_HUB_ENABLE_HF_TRANSFER=1 uv run huggingface-cli download QuixiAI/Qwen3-30B-A3B-AWQ --local-dir ./models/Qwen3-30B-A3B-AWQ'
+echo "See RUNBOOK.md for the rest of the day's sequence (pinned checkpoint choice + backup there)."

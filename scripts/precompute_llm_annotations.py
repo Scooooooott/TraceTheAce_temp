@@ -119,16 +119,39 @@ def main() -> None:
         return
 
     print(f"loading {args.model_path} via {args.backend} backend (thinking={not args.no_thinking})...")
+    load_start = time.time()
     if args.backend == "vllm":
         llm = load_vllm_model(args.model_path)
         generate_batch_fn = make_vllm_batch_generate_fn(
             llm, enable_thinking=not args.no_thinking, repetition_penalty=args.repetition_penalty
         )
+        count_tokens = llm.get_tokenizer().encode
     else:
         tokenizer, model = load_hf_model(args.model_path, load_in_4bit=True)
         generate_batch_fn = make_hf_batch_generate_fn(
             tokenizer, model, enable_thinking=not args.no_thinking, repetition_penalty=args.repetition_penalty
         )
+        count_tokens = tokenizer.encode
+    print(f"model loaded in {time.time() - load_start:.1f}s")
+
+    # Output-token-length distribution per task -- NOT recoverable after the
+    # fact from the cache pickles (score_combined discards raw generated
+    # text once a chunk's JSON is parsed), so this is the only point this
+    # can be measured. Cumulative across the whole run, printed after every
+    # chunk (see _summarize_lengths call below) -- for a --limit smoke run
+    # (single chunk) this is just that chunk's distribution.
+    output_token_lengths: dict[str, list[int]] = {"strategy": [], "mastery": []}
+
+    def _on_generated(kind: str, text: str) -> None:
+        output_token_lengths[kind].append(len(count_tokens(text, add_special_tokens=False)))
+
+    def _summarize_lengths(label: str, lengths: list[int]) -> str:
+        if not lengths:
+            return f"{label}: n=0"
+        s = sorted(lengths)
+        n = len(s)
+        p95 = s[min(n - 1, int(n * 0.95))]
+        return f"{label}: n={n} mean={sum(s) / n:.0f} p50={s[n // 2]} p95={p95} max={s[-1]}"
 
     run_start = time.time()
     n_done_this_run = 0
@@ -153,6 +176,7 @@ def main() -> None:
             mastery_session_of,
             max_new_tokens=args.max_new_tokens,
             retry_max_new_tokens=args.retry_max_new_tokens or None,
+            on_generated=_on_generated,
         )
         chunk_elapsed = time.time() - chunk_start
 
@@ -170,6 +194,11 @@ def main() -> None:
             f"chunk {start}-{start + len(chunk_session_ids)} sessions ({n_requests} requests): "
             f"{chunk_elapsed:.1f}s ({chunk_elapsed / len(chunk_session_ids):.2f}s/session), "
             f"strategy={len(strategy_cache)} mastery={len(mastery_cache)}, ETA {eta_hours:.1f}h"
+        )
+        print(
+            "  output tokens (cumulative): "
+            f"{_summarize_lengths('strategy', output_token_lengths['strategy'])}, "
+            f"{_summarize_lengths('mastery', output_token_lengths['mastery'])}"
         )
 
     print(f"done. wrote {strategy_cache_path if do_strategy else '(strategy skipped)'}")
