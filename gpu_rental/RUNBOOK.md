@@ -97,7 +97,15 @@ tar -xzf /workspace/trace-the-ace-raw.tar.gz -C data
 bash gpu_rental/setup_instance.sh
 ```
 
+`uv sync` 那步会显示 148 个包在装,可能有几分钟看着像卡住(torch 自带一整串 NVIDIA CUDA 库,单个就有几百MB-1GB+,进度条在大包上经常没有细粒度反馈)——**属于正常现象,不是卡死**。这一步只装 Python 包,不涉及任何模型权重,模型下载是下面单独的步骤。
+
 装完核对打印出来的 torch/vllm 版本和 `tutoring-outcomes-runtime/runtime/pyproject.toml` 完全一致。
+
+**`setup_instance.sh` 跑完立刻执行**(脚本自己会在结尾提醒):
+```bash
+source ~/.bashrc
+```
+`bash gpu_rental/setup_instance.sh` 是子进程运行的,脚本内部的 `export HF_HOME=.../export UV_CACHE_DIR=...` 只在那个子进程自己的 `uv sync`/`pip install` 调用里生效,子进程退出后不会带回你敲命令的这个父 shell——不 `source` 一下,下面手动敲的 `huggingface-cli download` 会掉回默认缓存路径(容器盘),把前面刚修好的磁盘归位又绕回去。开一个新 tmux 窗口也可以(新窗口是交互式 shell,自动读 `.bashrc`),但如果就在这个窗口继续敲命令,必须先 `source`。
 
 ```bash
 HF_HUB_ENABLE_HF_TRANSFER=1 uv run huggingface-cli download Qwen/Qwen3-8B-AWQ --local-dir ./models/Qwen3-8B-AWQ

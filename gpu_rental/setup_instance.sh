@@ -40,7 +40,16 @@ if ! command -v uv &>/dev/null; then
   source "$HOME/.cargo/env" 2>/dev/null || source "$HOME/.local/bin/env" 2>/dev/null || true
 fi
 
-uv sync
+# --no-install-package torch: pyproject.toml lists an unpinned "torch" (needed
+# transitively by sentence-transformers regardless of that explicit line, so
+# removing the line wouldn't help) -- without this flag, uv would install some
+# generic PyPI torch build here (with its own multi-GB NVIDIA CUDA dependency
+# set) only to have it immediately overwritten by the exact-pinned cu129
+# wheel below. This flag still resolves torch normally (satisfies
+# sentence-transformers' constraint in the lock) but skips physically
+# installing/downloading it, so it only gets fetched once, in the pinned
+# form the competition container actually runs.
+uv sync --no-install-package torch
 echo "=== .venv size (should land under /workspace since cwd is the cloned repo there) ==="
 du -sh .venv
 
@@ -67,8 +76,14 @@ echo "=== disk usage after setup (/workspace should hold everything large; / sho
 df -h /workspace /
 
 echo ""
-echo "Setup done. HF_HOME=/workspace/hf and UV_CACHE_DIR=/workspace/.uv-cache are exported in this"
-echo "shell and persisted to ~/.bashrc + /etc/profile.d for new sessions/tmux windows."
+echo "Setup done. HF_HOME=/workspace/hf and UV_CACHE_DIR=/workspace/.uv-cache are exported inside"
+echo "THIS SCRIPT's own process (a child of your shell) and persisted to ~/.bashrc + /etc/profile.d"
+echo "for future shells/tmux windows -- but NOT retroactively into the shell you launched this"
+echo "script FROM (child-process exports never propagate back to the parent shell)."
+echo ""
+echo ">>> Run 'source ~/.bashrc' in THIS terminal now, before typing any download command below <<<"
+echo "(a brand new tmux window/pane would pick these up automatically instead, if you prefer that)."
+echo ""
 echo "Next: download the candidate model(s), e.g.:"
 echo '  HF_HUB_ENABLE_HF_TRANSFER=1 uv run huggingface-cli download Qwen/Qwen3-8B-AWQ --local-dir ./models/Qwen3-8B-AWQ'
 echo '  HF_HUB_ENABLE_HF_TRANSFER=1 uv run huggingface-cli download QuixiAI/Qwen3-30B-A3B-AWQ --local-dir ./models/Qwen3-30B-A3B-AWQ'
