@@ -67,9 +67,11 @@ S_te 是外推不是实测,容器超时=整次提交作废+烧一次周配额。
 ```bash
 ssh <instance>
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv
-df -h
+df -h /workspace   # 确认 network volume 确实挂在这里、容量是申请的那个数(RunPod: network volume 固定挂载点是 /workspace)
 tmux new -s gpu_run
 ```
+
+**磁盘位置铁律(RunPod Network Volume vs Container Disk)**:Network Volume 挂载在 `/workspace`,Pod 终止后数据仍在;Container Disk(这次开的 60GB)跟 Pod 生命周期绑定,是临时的。下面所有步骤把仓库克隆到 `/workspace/trace-the-ace`,不是 `~`(`~` = `/root`,落在 60GB 的 Container Disk 上)——实测体积:8B-AWQ 6.11GB + 30B-A3B-AWQ 主选 16.83GB + data 0.8GB + venv(torch/vllm cu129,估计15-25GB)已经 43-49GB,60GB 里剩不了多少余量,一旦要换备胎 checkpoint(再 +16.83GB)直接爆盘。180GB 的 network volume 才是这些东西该待的地方。
 
 ## 阶段 1 — 上传数据 + 装环境(并行,~20-40 分钟)
 
@@ -83,15 +85,15 @@ scripts/precompute_llm_annotations.py、gpu_rental/、pyproject.toml、uv.lock�
 ```bash
 cd /home/scott/workspace/trace-the-ace
 tar --exclude=raw/train_transcripts.zip -czf /tmp/trace-the-ace-raw.tar.gz -C data raw
-rsync -avz /tmp/trace-the-ace-raw.tar.gz <instance>:~/trace-the-ace-raw.tar.gz
+rsync -avz /tmp/trace-the-ace-raw.tar.gz <instance>:/workspace/trace-the-ace-raw.tar.gz
 ```
 
 远程(tmux 里):
 ```bash
-git clone https://github.com/Scooooooott/TraceTheAce_temp.git ~/trace-the-ace
-cd ~/trace-the-ace
+git clone https://github.com/Scooooooott/TraceTheAce_temp.git /workspace/trace-the-ace
+cd /workspace/trace-the-ace
 mkdir -p data
-tar -xzf ~/trace-the-ace-raw.tar.gz -C data
+tar -xzf /workspace/trace-the-ace-raw.tar.gz -C data
 bash gpu_rental/setup_instance.sh
 ```
 
@@ -113,7 +115,7 @@ HF_HUB_ENABLE_HF_TRANSFER=1 uv run huggingface-cli download QuixiAI/Qwen3-30B-A3
 
 本地(另开终端):
 ```bash
-bash gpu_rental/sync_caches.sh <instance> ~/trace-the-ace 600
+bash gpu_rental/sync_caches.sh <instance> /workspace/trace-the-ace 600
 ```
 
 ## 阶段 2a — 采样配置 A/B(必测项,~20-30 分钟,8B 上跑,在阶段2主冒烟之前)

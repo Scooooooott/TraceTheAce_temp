@@ -10,7 +10,7 @@
 set -euo pipefail
 
 REMOTE="${1:?usage: sync_caches.sh user@host [remote_repo_path] [interval_seconds]}"
-REMOTE_PATH="${2:-~/trace-the-ace}"
+REMOTE_PATH="${2:-/workspace/trace-the-ace}"
 INTERVAL="${3:-600}"
 
 mkdir -p ./gpu_rental/backup
