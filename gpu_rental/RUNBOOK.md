@@ -105,21 +105,22 @@ source ~/.bashrc
 ```
 `bash gpu_rental/setup_instance.sh` 是子进程运行的,脚本内部的 `export HF_HOME=.../export UV_CACHE_DIR=.../export UV_NO_SYNC=1` 只在那个子进程自己的 `uv sync`/`pip install` 调用里生效,子进程退出后不会带回你敲命令的这个父 shell——不 `source` 一下,下面手动敲的命令会掉回默认缓存路径(容器盘)、且会重新踩到下面这条 `uv run` 自动 sync 的坑。开一个新 tmux 窗口也可以(新窗口是交互式 shell,自动读 `.bashrc`),但如果就在这个窗口继续敲命令,必须先 `source`。
 
-**`uv run` 自动 sync 会冲掉手动装的 cu129 torch(2026-07-26 踩过,已修复)**:`uv run` 默认在执行前先把 venv 同步回 `uv.lock` 的状态,而 `uv.lock` 锁的 torch 是通用版(如 2.13.0),不是 `setup_instance.sh` 里手动 `uv pip install` 装的 `torch==2.11.0+cu129`——不加防护的话,**每一次** `uv run`(包括后面所有 `uv run python -m scripts.precompute_llm_annotations ...`)都会先把 cu129 torch 卸掉装回通用版,现场看到的是一串 "Uninstalled 7 / Installed 7"。已经在 `setup_instance.sh` 里把 `export UV_NO_SYNC=1` 加进和 `HF_HOME`/`UV_CACHE_DIR` 同一套持久化机制,`source ~/.bashrc`(上面那步)就会带上,不用逐条加 `--no-sync`。若手上这台实例是用旧版脚本装的、已经在这之前踩过这个坑(venv 状态可能已经被反复冲刷污染),先清干净重装:
+**`uv run` 自动 sync 会冲掉手动装的 cu129 torch(2026-07-26 踩过,已修复)**:`uv run` 默认在执行前先把 venv 同步回 `uv.lock` 的状态,而 `uv.lock` 锁的 torch 是通用版(如 2.13.0),不是 `setup_instance.sh` 里手动 `uv pip install` 装的 `torch==2.11.0+cu129`——不加防护的话,**每一次** `uv run`(包括后面所有 `uv run python -m scripts.precompute_llm_annotations ...`)都会先把 cu129 torch 卸掉装回通用版,现场看到的是一串 "Uninstalled 7 / Installed 7"。已经在 `setup_instance.sh` 里把 `export UV_NO_SYNC=1` 加进和 `HF_HOME`/`UV_CACHE_DIR` 同一套持久化机制,`source ~/.bashrc`(上面那步)就会带上,不用逐条加 `--no-sync`。
+
+**venv 混装 torch 版本损坏(2026-07-27 踩过,已修复)**:在这条坑被修复(上面那条)之前,反复的 `uv run` 自动 sync 会在同一个 venv 里把 cu129 torch 卸了装、装了卸很多轮,留下的残留 dist-info/编译产物混杂,最终表现为 torch 的 inductor 编译器读到错位的源码(源码行号对不上、编译崩溃)——这是"文件损坏",不是配置问题,**改配置救不回已经装坏的 venv,只能删了重装**。`setup_instance.sh` 现在已经把这条也堵上了:
+
+1. 脚本一开头就检查 `.venv` 是否已存在,存在就直接报错退出,不会在旧状态上叠加安装——**必须先 `rm -rf .venv` 再重跑脚本**,不能指望脚本自己"修"一个已经装坏的 venv。
+2. 安装顺序改成先装 vllm(随它解析出什么临时的 torch/torchvision 版本),最后再用 `--force-reinstall` 把 `torch==2.11.0+cu129`/`torchvision==0.26.0+cu129`/`torchaudio==2.11.0+cu129` 三个包作为**同一次**从 PyTorch cu129 索引解析安装,确保这是最终落地的状态,且三者互相匹配(之前只手动锁了 torch 一个,torchvision 是被 vllm 自己隐式拉进来的,版本对不上就是这次损坏的根源之一)。
+3. 装完立刻做版本+import 自检(见下),不过就直接 `exit 1`,不会带着一个坏环境继续往下走到模型下载那一步。
+
+也就是说,**现在只需要**:
 ```bash
 rm -rf .venv
-uv sync --no-install-package torch
-uv pip install torch==2.11.0+cu129 --index-url https://download.pytorch.org/whl/cu129
-uv pip install "https://wheels.vllm.ai/ad7125a431e176d4161099480a66f0169609a690/vllm-0.21.0%2Bcu129-cp38-abi3-manylinux_2_34_x86_64.whl"
+bash gpu_rental/setup_instance.sh
 ```
+不用再手动敲 `uv sync`/`uv pip install torch`/`uv pip install vllm wheel` 这几行——脚本内部顺序已经改过,手动摘出来敲容易敲成旧的(错误的)顺序,重新踩坑。
 
-装完核对打印出来的 torch/vllm 版本和 `tutoring-outcomes-runtime/runtime/pyproject.toml` 完全一致,顺带确认 `UV_NO_SYNC` 真的生效了(值应为 `1`,不是空——这一步必须在上面 `source ~/.bashrc` 之后跑,不然验证命令自己又会触发一次 auto-sync):
-```bash
-echo "UV_NO_SYNC=$UV_NO_SYNC"
-uv run python -c "import torch, vllm; print('torch', torch.__version__); print('vllm', vllm.__version__); print('cuda', torch.cuda.is_available())"
-uv run python -c "import torch; print(torch.randn(3,3).cuda() @ torch.randn(3,3).cuda())"
-```
-期望:`torch 2.11.0+cu129`、`vllm 0.21.0`、`cuda True`、矩阵能正常算出结果。任一不对就停,不要往下走。
+脚本跑完会自己打印自检结果(`torch`/`torchvision`/`torchaudio` 精确版本、`cuda available`、`transformers`/`vllm` 能否 import),自检不过脚本直接非零退出并停在那里,不需要再手动敲版本核对命令。期望看到 `self-check passed:` 开头的一段,`torch 2.11.0+cu129`/`cuda available: True`。任一环节报错就停,不要往下走到模型下载。
 
 ```bash
 HF_HUB_ENABLE_HF_TRANSFER=1 uv run huggingface-cli download Qwen/Qwen3-8B-AWQ --local-dir ./models/Qwen3-8B-AWQ

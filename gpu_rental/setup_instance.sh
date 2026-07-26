@@ -11,6 +11,24 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# Refuse to run against an existing venv (2026-07-27, found the hard way):
+# the corrupted-torch incident this script was rewritten to prevent came
+# from running the manual torch pin (below) repeatedly against a venv that
+# already had SOME torch installed (by a previous partial run, or by `uv
+# run`'s auto-sync before UV_NO_SYNC was in place) -- each reinstall left
+# behind stale dist-info/compiled-extension remnants from the prior
+# version, and torch's inductor compiler (which reads its own source
+# layout at import time) ended up reading a mix of two versions' files.
+# `--force-reinstall` below helps but a from-scratch venv is the only
+# actually-verified-clean starting point. Fail fast and say so rather than
+# silently installing on top of unknown existing state.
+if [ -d .venv ]; then
+  echo "FATAL: .venv already exists. This script must run against a fresh venv --" >&2
+  echo "installing on top of an existing one is exactly how the mixed-torch-version" >&2
+  echo "corruption happened before. Run 'rm -rf .venv' first, then rerun this script." >&2
+  exit 1
+fi
+
 # Persist HF_HOME + UV_CACHE_DIR + UV_NO_SYNC to every future shell on this
 # box (new tmux windows, reconnected SSH sessions) -- not just this script's
 # own environment.
@@ -67,20 +85,81 @@ fi
 # wheel below. This flag still resolves torch normally (satisfies
 # sentence-transformers' constraint in the lock) but skips physically
 # installing/downloading it, so it only gets fetched once, in the pinned
-# form the competition container actually runs.
+# form the competition container actually runs. torchvision/torchaudio
+# aren't in THIS project's pyproject.toml/uv.lock at all (grepped, absent --
+# nothing in src/ imports either one, this is a text-only pipeline), so
+# there's nothing to exclude for them here; they only enter the picture
+# via the vllm wheel below.
 uv sync --no-install-package torch
 echo "=== .venv size (should land under /workspace since cwd is the cloned repo there) ==="
 du -sh .venv
 
-# torch + vllm: exact pins/wheel URL copied from
-# tutoring-outcomes-runtime/runtime/pyproject.toml as of 2026-07-24. If that
-# file has changed since, re-copy the current values rather than trusting
-# these -- the whole point is byte-for-byte match with the container.
-uv pip install torch==2.11.0+cu129 --index-url https://download.pytorch.org/whl/cu129
+# vllm FIRST, torch/torchvision/torchaudio pin LAST -- reordered from the
+# previous torch-then-vllm sequence (2026-07-27, root-caused the
+# corruption incident). The competition runtime
+# (tutoring-outcomes-runtime/runtime/pyproject.toml) pins all three
+# together from the SAME pytorch-cu129 index (torch==2.11.0+cu129,
+# torchvision==0.26.0+cu129, torchaudio==2.11.0+cu129) -- torchvision in
+# particular is never mentioned in trace-the-ace's own dependencies, so it
+# only entered this venv at all via the vllm wheel's own transitive
+# requirement, using whatever unpinned/generic-index version pip's
+# resolver picked for it. Installing torch alone first (the old order)
+# left a window where vllm's own install could still drag in a mismatched
+# torchvision (or nudge torch itself) to satisfy ITS resolution -- e.g. a
+# generic torchvision 0.26.0 built against generic-PyPI torch 2.13.0
+# landing next to our pinned cu129 torch, exactly the
+# ModuleNotFoundError/mixed-dist-info state hit in practice. Installing
+# vllm first (let it pull in whatever transitive torch stack it wants),
+# then force-reinstalling the exact matching cu129 triplet from PyTorch's
+# own index as ONE atomic resolution, guarantees the pinned triplet is the
+# last thing written and that torch/torchvision/torchaudio are mutually
+# consistent (resolved together, not three independent installs) --
+# matching the container byte-for-byte the way this script's header
+# already claims to. If tutoring-outcomes-runtime's pins change, re-copy
+# the current values from there rather than trusting these.
 uv pip install "https://wheels.vllm.ai/ad7125a431e176d4161099480a66f0169609a690/vllm-0.21.0%2Bcu129-cp38-abi3-manylinux_2_34_x86_64.whl"
+uv pip install --force-reinstall \
+  torch==2.11.0+cu129 torchvision==0.26.0+cu129 torchaudio==2.11.0+cu129 \
+  --index-url https://download.pytorch.org/whl/cu129
 
-echo "=== installed versions ==="
-uv run python -c "import torch, vllm; print('torch', torch.__version__); print('vllm', vllm.__version__); print('cuda available', torch.cuda.is_available())"
+# Self-check: fail loudly HERE, before any multi-GB model download, rather
+# than discovering a broken torch/vllm pairing hours into an unattended
+# run (the inductor-compiler-crash failure mode this whole rewrite exists
+# to catch earlier). Checks, in order: (1) exact pinned versions actually
+# landed -- catches force-reinstall silently resolving to something else;
+# (2) CUDA actually visible to torch; (3) transformers imports clean
+# (exercises the torch/torchvision pairing transformers' own import graph
+# touches); (4) vllm imports AND its LLM class is constructible-import
+# clean (exercises vllm's own compiled-extension binding against the
+# force-reinstalled torch -- this is the one step that would have caught
+# the incident immediately instead of hours later).
+echo "=== self-check: pinned versions + imports ==="
+uv run python -c "
+from importlib.metadata import version
+
+expected = {
+    'torch': '2.11.0+cu129',
+    'torchvision': '0.26.0+cu129',
+    'torchaudio': '2.11.0+cu129',
+}
+for pkg, want in expected.items():
+    got = version(pkg)
+    assert got == want, f'{pkg} version mismatch: expected {want!r}, got {got!r}'
+
+import torch
+assert torch.cuda.is_available(), 'torch.cuda.is_available() is False'
+
+import transformers
+import vllm
+from vllm import LLM
+
+print('self-check passed:')
+print('  torch', torch.__version__, '| cuda available:', torch.cuda.is_available())
+print('  torchvision', version('torchvision'))
+print('  torchaudio', version('torchaudio'))
+print('  transformers', transformers.__version__)
+print('  vllm', vllm.__version__)
+" || { echo "FATAL: environment self-check failed (see error above). Do NOT proceed to model downloads -- fix this first." >&2; exit 1; }
 
 echo "=== nvidia-smi ==="
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv
