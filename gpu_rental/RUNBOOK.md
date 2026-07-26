@@ -99,13 +99,27 @@ bash gpu_rental/setup_instance.sh
 
 `uv sync` 那步会显示 148 个包在装,可能有几分钟看着像卡住(torch 自带一整串 NVIDIA CUDA 库,单个就有几百MB-1GB+,进度条在大包上经常没有细粒度反馈)——**属于正常现象,不是卡死**。这一步只装 Python 包,不涉及任何模型权重,模型下载是下面单独的步骤。
 
-装完核对打印出来的 torch/vllm 版本和 `tutoring-outcomes-runtime/runtime/pyproject.toml` 完全一致。
-
 **`setup_instance.sh` 跑完立刻执行**(脚本自己会在结尾提醒):
 ```bash
 source ~/.bashrc
 ```
-`bash gpu_rental/setup_instance.sh` 是子进程运行的,脚本内部的 `export HF_HOME=.../export UV_CACHE_DIR=...` 只在那个子进程自己的 `uv sync`/`pip install` 调用里生效,子进程退出后不会带回你敲命令的这个父 shell——不 `source` 一下,下面手动敲的 `huggingface-cli download` 会掉回默认缓存路径(容器盘),把前面刚修好的磁盘归位又绕回去。开一个新 tmux 窗口也可以(新窗口是交互式 shell,自动读 `.bashrc`),但如果就在这个窗口继续敲命令,必须先 `source`。
+`bash gpu_rental/setup_instance.sh` 是子进程运行的,脚本内部的 `export HF_HOME=.../export UV_CACHE_DIR=.../export UV_NO_SYNC=1` 只在那个子进程自己的 `uv sync`/`pip install` 调用里生效,子进程退出后不会带回你敲命令的这个父 shell——不 `source` 一下,下面手动敲的命令会掉回默认缓存路径(容器盘)、且会重新踩到下面这条 `uv run` 自动 sync 的坑。开一个新 tmux 窗口也可以(新窗口是交互式 shell,自动读 `.bashrc`),但如果就在这个窗口继续敲命令,必须先 `source`。
+
+**`uv run` 自动 sync 会冲掉手动装的 cu129 torch(2026-07-26 踩过,已修复)**:`uv run` 默认在执行前先把 venv 同步回 `uv.lock` 的状态,而 `uv.lock` 锁的 torch 是通用版(如 2.13.0),不是 `setup_instance.sh` 里手动 `uv pip install` 装的 `torch==2.11.0+cu129`——不加防护的话,**每一次** `uv run`(包括后面所有 `uv run python -m scripts.precompute_llm_annotations ...`)都会先把 cu129 torch 卸掉装回通用版,现场看到的是一串 "Uninstalled 7 / Installed 7"。已经在 `setup_instance.sh` 里把 `export UV_NO_SYNC=1` 加进和 `HF_HOME`/`UV_CACHE_DIR` 同一套持久化机制,`source ~/.bashrc`(上面那步)就会带上,不用逐条加 `--no-sync`。若手上这台实例是用旧版脚本装的、已经在这之前踩过这个坑(venv 状态可能已经被反复冲刷污染),先清干净重装:
+```bash
+rm -rf .venv
+uv sync --no-install-package torch
+uv pip install torch==2.11.0+cu129 --index-url https://download.pytorch.org/whl/cu129
+uv pip install "https://wheels.vllm.ai/ad7125a431e176d4161099480a66f0169609a690/vllm-0.21.0%2Bcu129-cp38-abi3-manylinux_2_34_x86_64.whl"
+```
+
+装完核对打印出来的 torch/vllm 版本和 `tutoring-outcomes-runtime/runtime/pyproject.toml` 完全一致,顺带确认 `UV_NO_SYNC` 真的生效了(值应为 `1`,不是空——这一步必须在上面 `source ~/.bashrc` 之后跑,不然验证命令自己又会触发一次 auto-sync):
+```bash
+echo "UV_NO_SYNC=$UV_NO_SYNC"
+uv run python -c "import torch, vllm; print('torch', torch.__version__); print('vllm', vllm.__version__); print('cuda', torch.cuda.is_available())"
+uv run python -c "import torch; print(torch.randn(3,3).cuda() @ torch.randn(3,3).cuda())"
+```
+期望:`torch 2.11.0+cu129`、`vllm 0.21.0`、`cuda True`、矩阵能正常算出结果。任一不对就停,不要往下走。
 
 ```bash
 HF_HUB_ENABLE_HF_TRANSFER=1 uv run huggingface-cli download Qwen/Qwen3-8B-AWQ --local-dir ./models/Qwen3-8B-AWQ
