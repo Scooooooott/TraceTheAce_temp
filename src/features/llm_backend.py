@@ -45,6 +45,8 @@ inconsistency:
   the documented vLLM API, but unverified until run somewhere real.
 """
 
+import os
+
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
@@ -246,11 +248,22 @@ def load_vllm_model(model_path: str, **llm_kwargs):
     labeling run and submission_src/main.py's production run, same
     single-source-of-truth rationale as ENABLE_THINKING/REPETITION_PENALTY
     -- override via llm_kwargs only for a deliberate one-off experiment,
-    not as the normal path."""
+    not as the normal path.
+
+    disable_log_stats defaults to True (vLLM's periodic throughput/prefix-
+    cache-hit-rate log lines off) -- the right default for a real labeling
+    run, where hours of unattended logging noise is pure cost. Set the
+    VLLM_LOG_STATS=1 environment variable to flip it on for a throughput
+    smoke test (see gpu_rental/RUNBOOK.md); no caller code changes needed
+    since neither scripts/precompute_llm_annotations.py nor
+    submission_src/main.py pass disable_log_stats themselves. Still a
+    setdefault, not a hardcoded kwarg, so a future caller that does need to
+    override this explicitly still can."""
     from vllm import LLM
 
     llm_kwargs.setdefault("max_model_len", MAX_MODEL_LEN)
     llm_kwargs.setdefault("enable_prefix_caching", ENABLE_PREFIX_CACHING)
+    llm_kwargs.setdefault("disable_log_stats", os.environ.get("VLLM_LOG_STATS", "") != "1")
     return LLM(model=model_path, quantization="awq", dtype="float16", **llm_kwargs)
 
 
