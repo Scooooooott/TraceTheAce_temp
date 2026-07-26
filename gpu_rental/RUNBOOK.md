@@ -153,7 +153,11 @@ uv run python -m scripts.precompute_llm_annotations ./models/Qwen3-30B-A3B-AWQ -
 
 检查清单:
 - [ ] 两个模型都能加载,无版本/内核报错(**8B 先跑,已知能跑,用它排查环境问题最快**)
-- [ ] 显存峰值(`watch -n 2 nvidia-smi`,另开一个 tmux 窗口)
+- [ ] 显存 + 磁盘水位(另开一个 tmux 窗口常驻,冒烟和后面的全量都用它盯):
+  ```bash
+  watch -n 30 'nvidia-smi; echo ---; df -h /workspace /; echo ---; du -sh /workspace/hf 2>/dev/null'
+  ```
+  同时看 GPU、Network Volume(`/workspace`)、**Container Disk 根分区(`/`)** 三个水位——`/` 如果开始异常增长,说明还有哪个工具的默认写入点没钉在 `/workspace`,这条命令能当场抓到,不用等爆盘才发现
 - [ ] `chunk` 打印的耗时/ETA——记录 cold prefill+decode 吞吐,替换预算表里的假设区间
 - [ ] **`score_combined` 打印的重试统计**(`N/total needed retry, M/N still failed`)——首轮失败率 > 3-5% 就先回去改 prompt 措辞(退化对指令措辞敏感),不要指望重试硬扛
 - [ ] **vLLM 的 prefix cache 命中率**(日志里 vLLM 自己周期性打印的吞吐/命中率行,不是我们代码打的,格式以实际跑出来的为准)——理论上界约 `前缀占比×(session内平均请求数-1)/该请求数`;如果显著低于这个数,两个旋钮按序试:调小 `--chunk-size`(默认300,先试100)、把每个 session 的 strategy 请求提前一个 chunk
@@ -164,14 +168,20 @@ uv run python -m scripts.precompute_llm_annotations ./models/Qwen3-30B-A3B-AWQ -
 
 ## 阶段 3 — 8B 全量过夜(7-12h,保底落袋)
 
-启动前过一遍:阶段2a 的 A/B 结论已经写进 `llm_config.py`(或者确认维持 1.3+greedy)、A/B 那两个一次性缓存文件已经删掉、确认正式 `--model-id qwen3-8b-awq` 冒烟是用冻结后的配置跑的。三件事按顺序过完再回车。tmux 里 `nohup` 是冗余的(tmux 本身就防挂断)但无害,保留:
+启动前过一遍(按顺序,过完再回车):
+1. 阶段2a 的 A/B 结论已经写进 `llm_config.py`(或者确认维持 1.3+greedy)
+2. A/B 那两个一次性缓存文件已经删掉
+3. 确认正式 `--model-id qwen3-8b-awq` 冒烟是用冻结后的配置跑的
+4. **磁盘水位**:`/workspace` 剩余 >30GB 且 `/`(Container Disk 根分区)剩余 >20GB——过夜跑的是 7-12 小时无人值守,爆盘是这里代价最高的失败模式(比容器超时更难现场补救,补救得等醒来),启动前这一步不能省
+
+tmux 里 `nohup` 是冗余的(tmux 本身就防挂断)但无害,保留:
 
 ```bash
 nohup uv run python -m scripts.precompute_llm_annotations ./models/Qwen3-8B-AWQ --model-id qwen3-8b-awq --backend vllm > annotations_8b.log 2>&1 &
 wait
 ```
 
-`sync_caches.sh` 本地持续跑着,每 10 分钟自动回传。盯前 20 分钟确认吞吐、checkpoint 落盘、显存稳定,然后可以离开去睡。每半小时(醒着的话)`tail -f *.log` 瞄一眼 ETA。
+`sync_caches.sh` 本地持续跑着,每 10 分钟自动回传。阶段2那条 `watch -n 30 '...'` 磁盘监控窗口**整晚留着别关**——过夜期间才是慢性磁盘泄漏真正有时间累积到爆盘的窗口,不是只在冒烟那几十分钟看一眼。盯前 20 分钟确认吞吐、checkpoint 落盘、显存/磁盘稳定,然后可以离开去睡。每半小时(醒着的话)`tail -f *.log` 瞄一眼 ETA。
 
 ## 次日 — 30B-A3B 视判定跑子集
 

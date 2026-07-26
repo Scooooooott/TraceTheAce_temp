@@ -11,12 +11,38 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# Persist HF_HOME + UV_CACHE_DIR to every future shell on this box (new tmux
+# windows, reconnected SSH sessions) -- not just this script's own
+# environment. Without this, huggingface-cli/uv silently fall back to
+# ~/.cache/{huggingface,uv} on RunPod's Container Disk (60GB, tied to pod
+# lifecycle), undoing the /workspace (Network Volume, 180GB) redirect the
+# rest of this repo's paths depend on (see RUNBOOK.md's disk-location rule)
+# -- a 23GB checkpoint landing there mid-download is exactly the "found out
+# hours into an unattended overnight run" failure this is meant to prevent.
+# Written to both ~/.bashrc (new tmux windows: interactive non-login shells
+# read this) and /etc/profile.d (SSH login shells) for coverage; exported
+# directly below too so THIS script's own uv/hf calls already use it.
+# Idempotent -- grep guards against duplicate lines on repeated runs.
+ENV_BLOCK='export HF_HOME=/workspace/hf
+export UV_CACHE_DIR=/workspace/.uv-cache'
+if ! grep -qF "HF_HOME=/workspace/hf" "$HOME/.bashrc" 2>/dev/null; then
+  printf '\n%s\n' "$ENV_BLOCK" >> "$HOME/.bashrc"
+fi
+if [ -w /etc/profile.d ] && [ ! -f /etc/profile.d/trace-the-ace-env.sh ]; then
+  printf '%s\n' "$ENV_BLOCK" > /etc/profile.d/trace-the-ace-env.sh
+fi
+export HF_HOME=/workspace/hf
+export UV_CACHE_DIR=/workspace/.uv-cache
+mkdir -p "$HF_HOME" "$UV_CACHE_DIR"
+
 if ! command -v uv &>/dev/null; then
   curl -LsSf https://astral.sh/uv/install.sh | sh
   source "$HOME/.cargo/env" 2>/dev/null || source "$HOME/.local/bin/env" 2>/dev/null || true
 fi
 
 uv sync
+echo "=== .venv size (should land under /workspace since cwd is the cloned repo there) ==="
+du -sh .venv
 
 # torch + vllm: exact pins/wheel URL copied from
 # tutoring-outcomes-runtime/runtime/pyproject.toml as of 2026-07-24. If that
@@ -37,7 +63,13 @@ nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv
 uv pip install hf_transfer huggingface_hub
 
 echo ""
-echo "Setup done. Next: download the candidate model(s), e.g.:"
+echo "=== disk usage after setup (/workspace should hold everything large; / should stay small) ==="
+df -h /workspace /
+
+echo ""
+echo "Setup done. HF_HOME=/workspace/hf and UV_CACHE_DIR=/workspace/.uv-cache are exported in this"
+echo "shell and persisted to ~/.bashrc + /etc/profile.d for new sessions/tmux windows."
+echo "Next: download the candidate model(s), e.g.:"
 echo '  HF_HUB_ENABLE_HF_TRANSFER=1 uv run huggingface-cli download Qwen/Qwen3-8B-AWQ --local-dir ./models/Qwen3-8B-AWQ'
 echo '  HF_HUB_ENABLE_HF_TRANSFER=1 uv run huggingface-cli download QuixiAI/Qwen3-30B-A3B-AWQ --local-dir ./models/Qwen3-30B-A3B-AWQ'
 echo "See RUNBOOK.md for the rest of the day's sequence (pinned checkpoint choice + backup there)."
